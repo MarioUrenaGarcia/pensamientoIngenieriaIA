@@ -1,139 +1,192 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Cubo 3D rotando en terminal, renderizado en ASCII con z-buffer.
-Solo usa la librería estándar (curses + math), no requiere instalar nada.
-
-Uso:
-    python3 cube3d.py
-
-Controles:
-    q       -> salir
-    +/-     -> más rápido / más lento
-"""
-
-import curses
+"""Cubo 3D rotando en la terminal con iluminación, z-buffer y sombra sobre el piso.
+Controles: + / - cambian la velocidad, q sale."""
 import math
+import os
+import shutil
+import sys
 import time
 
-WIDTH = 50
-HEIGHT = 25
-DISTANCE = 60
-K1 = 30  # factor de escala de proyección
+if os.name == "nt":
+    import msvcrt
+else:
+    import select
+    import termios
+    import tty
 
-SURFACE_CHARS = ".,-~:;=!*#$@"
-
-
-def rotate(x, y, z, a, b, c):
-    """Rota el punto (x,y,z) por los ángulos a (X), b (Y), c (Z)."""
-    # Rotación en X
-    y, z = y * math.cos(a) - z * math.sin(a), y * math.sin(a) + z * math.cos(a)
-    # Rotación en Y
-    x, z = x * math.cos(b) + z * math.sin(b), -x * math.sin(b) + z * math.cos(b)
-    # Rotación en Z
-    x, y = x * math.cos(c) - y * math.sin(c), x * math.sin(c) + y * math.cos(c)
-    return x, y, z
+CHARS = ".,-~:;=!*#$@"     # de oscuro a brillante
+FLOOR_Y = -2.0             # altura del piso
+DIST = 6.0                 # distancia de la cámara
+STEP = 0.05                # densidad de puntos del cubo
+FPS = 30
 
 
-def project(x, y, z):
-    z_eff = z + DISTANCE
-    ooz = 1.0 / z_eff if z_eff != 0 else 0
-    xp = int(WIDTH / 2 + K1 * ooz * x * 2)  # *2 compensa aspecto de caracteres
-    yp = int(HEIGHT / 2 + K1 * ooz * y)
-    return xp, yp, ooz
+def normalize(v):
+    m = math.sqrt(sum(c * c for c in v))
+    return tuple(c / m for c in v)
 
 
-def draw_surface(buffer, zbuffer, cube_x, cube_y, cube_z, ch, a, b, c):
-    """Rellena una cara del cubo muestreando puntos en su superficie."""
-    step = 0.4
-    u = -8.0
-    while u < 8.0:
-        v = -8.0
-        while v < 8.0:
-            if cube_x is not None:
-                x, y, z = cube_x, u, v
-            elif cube_y is not None:
-                x, y, z = u, cube_y, v
-            else:
-                x, y, z = u, v, cube_z
-
-            rx, ry, rz = rotate(x, y, z, a, b, c)
-            xp, yp, ooz = project(rx, ry, rz)
-
-            if 0 <= xp < WIDTH and 0 <= yp < HEIGHT:
-                if ooz > zbuffer[yp][xp]:
-                    zbuffer[yp][xp] = ooz
-                    luminance_index = min(int(ooz * K1 * 3), len(SURFACE_CHARS) - 1)
-                    buffer[yp][xp] = SURFACE_CHARS[max(luminance_index, 0)]
-            v += step
-        u += step
+LX, LY, LZ = normalize((-1.0, 1.5, -1.0))   # dirección hacia la luz
 
 
-def render_frame(a, b, c):
-    buffer = [[' ' for _ in range(WIDTH)] for _ in range(HEIGHT)]
-    zbuffer = [[0.0 for _ in range(WIDTH)] for _ in range(HEIGHT)]
+def build_cube():
+    faces = [
+        ((1, 0, 0), (0, 1, 0), (0, 0, 1)), ((-1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        ((0, 1, 0), (1, 0, 0), (0, 0, 1)), ((0, -1, 0), (1, 0, 0), (0, 0, 1)),
+        ((0, 0, 1), (1, 0, 0), (0, 1, 0)), ((0, 0, -1), (1, 0, 0), (0, 1, 0)),
+    ]
+    n = int(2 / STEP) + 1
+    pts = []
+    for nrm, u, v in faces:
+        for i in range(n):
+            a = -1 + 2 * i / (n - 1)
+            for j in range(n):
+                b = -1 + 2 * j / (n - 1)
+                p = tuple(nrm[k] + u[k] * a + v[k] * b for k in range(3))
+                pts.append((p, nrm))
+    return pts
 
-    size = 8
-    draw_surface(buffer, zbuffer, size, None, None, '@', a, b, c)   # +X
-    draw_surface(buffer, zbuffer, -size, None, None, '$', a, b, c)  # -X
-    draw_surface(buffer, zbuffer, None, size, None, '~', a, b, c)   # +Y
-    draw_surface(buffer, zbuffer, None, -size, None, '#', a, b, c)  # -Y
-    draw_surface(buffer, zbuffer, None, None, size, ';', a, b, c)   # +Z
-    draw_surface(buffer, zbuffer, None, None, -size, '.', a, b, c)  # -Z
 
-    return buffer
+def rotation(a, b, c):
+    ca, sa, cb, sb, cc, sc = math.cos(a), math.sin(a), math.cos(b), math.sin(b), math.cos(c), math.sin(c)
+    # R = Rz(c) * Ry(b) * Rx(a)
+    return (
+        (cc * cb, cc * sb * sa - sc * ca, cc * sb * ca + sc * sa),
+        (sc * cb, sc * sb * sa + cc * ca, sc * sb * ca - cc * sa),
+        (-sb, cb * sa, cb * ca),
+    )
 
 
-def main(stdscr):
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_CYAN, -1)
+class Keys:
+    """Lectura de teclas sin bloquear ni esperar Enter (Windows y Unix)."""
 
-    a = b = c = 0.0
-    delay = 0.03
-    speed = 0.05
+    def start(self):
+        if os.name != "nt":
+            self.fd = sys.stdin.fileno()
+            self.old = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
 
-    while True:
-        key = stdscr.getch()
-        if key == ord('q'):
-            break
-        elif key == ord('+'):
-            speed += 0.01
-        elif key == ord('-'):
-            speed = max(0.0, speed - 0.01)
+    def stop(self):
+        if os.name != "nt":
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
 
-        buffer = render_frame(a, b, c)
+    def read(self):
+        keys = []
+        if os.name == "nt":
+            while msvcrt.kbhit():
+                keys.append(msvcrt.getwch())
+        else:
+            while select.select([sys.stdin], [], [], 0)[0]:
+                keys.append(os.read(self.fd, 1).decode(errors="ignore"))
+        return keys
 
-        stdscr.erase()
-        max_y, max_x = stdscr.getmaxyx()
-        offset_y = max(0, (max_y - HEIGHT) // 2)
-        offset_x = max(0, (max_x - WIDTH) // 2)
 
-        for row in range(HEIGHT):
-            line = "".join(buffer[row])
-            try:
-                stdscr.addstr(offset_y + row, offset_x, line, curses.color_pair(1))
-            except curses.error:
-                pass
+def main():
+    if os.name == "nt":
+        os.system("")  # habilita ANSI en Windows
 
-        try:
-            stdscr.addstr(offset_y + HEIGHT + 1, offset_x, "q: salir   +/-: velocidad")
-        except curses.error:
-            pass
+    cols, rows = shutil.get_terminal_size((80, 24))
+    W, H = cols, rows - 1
+    N = W * H
+    f = min(W / 4.5, H * 0.8)
 
-        stdscr.refresh()
+    def project(x, y, z):
+        ooz = 1 / z
+        return int(W / 2 + 2 * f * x * ooz), int(H / 2 - f * y * ooz), ooz
 
-        a += speed
-        b += speed * 0.7
-        c += speed * 0.5
+    # Piso estático (tablero de ajedrez), se calcula una sola vez
+    floor_z = [0.0] * N
+    floor_buf = [(" ", 0)] * N
+    floor_mask = bytearray(N)
+    steps = [i * 0.05 - 3 for i in range(121)]
+    for fx in steps:
+        for fz in steps:
+            sx, sy, ooz = project(fx, FLOOR_Y, fz + DIST)
+            if 0 <= sx < W and 0 <= sy < H:
+                i = sy * W + sx
+                if ooz > floor_z[i]:
+                    floor_z[i] = ooz
+                    checker = (math.floor(fx) + math.floor(fz)) % 2
+                    floor_buf[i] = (":" if checker else ".", 244 if checker else 240)
+                    floor_mask[i] = 1
 
-        time.sleep(delay)
+    cube = build_cube()
+    A = B = C = 0.0
+    speed = 1.0
+    keys = Keys()
+    keys.start()
+    sys.stdout.write("\x1b[?1049h\x1b[2J\x1b[?25l")  # pantalla alternativa, limpiar, ocultar cursor
+
+    try:
+        while True:
+            t0 = time.time()
+            zbuf = floor_z[:]
+            buf = floor_buf[:]
+            cube_mask = bytearray(N)
+            shadow = bytearray(N)
+            (m00, m01, m02), (m10, m11, m12), (m20, m21, m22) = rotation(A, B, C)
+
+            for (px, py, pz), (nx, ny, nz) in cube:
+                x = m00 * px + m01 * py + m02 * pz
+                y = m10 * px + m11 * py + m12 * pz
+                z = m20 * px + m21 * py + m22 * pz
+
+                # Sombra: proyectar el punto sobre el piso siguiendo la luz
+                t = (y - FLOOR_Y) / LY
+                sx, sy, _ = project(x - t * LX, FLOOR_Y, z - t * LZ + DIST)
+                if 0 <= sx < W and 0 <= sy < H:
+                    shadow[sy * W + sx] = 1
+
+                # Cubo con z-buffer e iluminación difusa
+                sx, sy, ooz = project(x, y, z + DIST)
+                if 0 <= sx < W and 0 <= sy < H:
+                    i = sy * W + sx
+                    if ooz > zbuf[i]:
+                        zbuf[i] = ooz
+                        rnx = m00 * nx + m01 * ny + m02 * nz
+                        rny = m10 * nx + m11 * ny + m12 * nz
+                        rnz = m20 * nx + m21 * ny + m22 * nz
+                        lum = rnx * LX + rny * LY + rnz * LZ
+                        val = 0.12 + 0.88 * max(0.0, lum)
+                        buf[i] = (CHARS[int(val * (len(CHARS) - 1))], 232 + int(val * 23))
+                        cube_mask[i] = 1
+
+            for i in range(N):
+                if shadow[i] and floor_mask[i] and not cube_mask[i]:
+                    buf[i] = (" ", 0)
+
+            lines = []
+            for r in range(H):
+                parts, last = [], None
+                for ch, col in buf[r * W:(r + 1) * W]:
+                    if col != last and ch != " ":
+                        parts.append(f"\x1b[38;5;{col}m")
+                        last = col
+                    parts.append(ch)
+                lines.append("".join(parts))
+            status = f"\x1b[0m velocidad: {speed:.2f}x   [+/-] velocidad   [q] salir\x1b[K"
+            sys.stdout.write("\x1b[H" + "\n".join(lines) + "\n" + status)
+            sys.stdout.flush()
+
+            for ch in keys.read():
+                if ch in "qQ":
+                    return
+                if ch in "+=":
+                    speed = min(speed * 1.25, 10.0)
+                elif ch in "-_":
+                    speed = max(speed / 1.25, 0.05)
+
+            A += 0.04 * speed
+            B += 0.03 * speed
+            C += 0.015 * speed
+            time.sleep(max(0.0, 1 / FPS - (time.time() - t0)))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        keys.stop()
+        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")  # restaurar colores, cursor y pantalla original
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
-    try:
-        curses.wrapper(main)
-    except KeyboardInterrupt:
-        pass
+    main()
